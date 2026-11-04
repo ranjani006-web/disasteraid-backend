@@ -6,7 +6,10 @@ import unicodedata
 import time
 import threading
 from datetime import datetime, timezone
-
+HTTP_HEADERS = {
+    "User-Agent": "DisasterAid/1.0 (Disaster Warning Application)",
+    "Accept": "application/json"
+}
 app = Flask(__name__)
 
 # --------------------------------------------------
