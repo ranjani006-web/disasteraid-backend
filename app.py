@@ -11,6 +11,12 @@ HTTP_HEADERS = {
     "Accept": "application/json"
 }
 app = Flask(__name__)
+# --------------------------------------------------
+# WEATHER CACHE
+# --------------------------------------------------
+
+weather_cache = {}
+WEATHER_CACHE_SECONDS = 300
 
 # --------------------------------------------------
 # DATABASE CONFIGURATION
