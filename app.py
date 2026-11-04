@@ -337,6 +337,16 @@ def get_weather():
 
         latitude = place["latitude"]
         longitude = place["longitude"]
+        cache_key = f"{latitude:.4f},{longitude:.4f}"
+        current_time = time.time()
+
+        cached_weather = weather_cache.get(cache_key)
+
+        if cached_weather and (
+            current_time - cached_weather["saved_at"]
+            < WEATHER_CACHE_SECONDS
+        ):
+            return jsonify(cached_weather["data"]), 200 
 
         weather_response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -391,7 +401,7 @@ def get_weather():
 
             forecast.append(day_data)
 
-        return jsonify({
+        weather_result = {
             "success": True,
             "location": place.get("name", location),
             "country": place.get("country", ""),
@@ -400,7 +410,14 @@ def get_weather():
             "current_weather": weather_data.get("current", {}),
             "daily": daily,
             "forecast": forecast
-        }), 200
+        }
+
+        weather_cache[cache_key] = {
+            "data": weather_result,
+            "saved_at": time.time()
+        }
+
+        return jsonify(weather_result), 200
 
     except requests.RequestException:
         app.logger.exception("Weather API request failed")
