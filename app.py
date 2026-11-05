@@ -325,7 +325,7 @@ def get_weather():
             "success": False,
             "message": "Please enter a location."
         }), 400
-
+        
     try:
         place = get_indian_place(location)
 
@@ -418,8 +418,8 @@ def get_weather():
         }
 
         return jsonify(weather_result), 200
-
-  except requests.RequestException:
+    
+    except requests.RequestException:
         app.logger.exception("Weather API request failed")
 
         cached_weather = weather_cache.get(cache_key)
@@ -428,7 +428,6 @@ def get_weather():
             app.logger.warning(
                 "Returning cached weather because the weather service failed."
             )
-
             return jsonify(cached_weather["data"]), 200
 
         return jsonify({
@@ -442,8 +441,6 @@ def get_weather():
             "success": False,
             "message": "Could not read the weather information."
         }), 502
-
-
 # --------------------------------------------------
 # DISASTER REPORT API
 # --------------------------------------------------
