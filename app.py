@@ -5,6 +5,7 @@ import os
 import unicodedata
 import time
 import threading
+import json
 from datetime import datetime, timezone
 HTTP_HEADERS = {
     "User-Agent": "DisasterAid/1.0 (Disaster Warning Application)",
@@ -14,9 +15,127 @@ app = Flask(__name__)
 # --------------------------------------------------
 # WEATHER CACHE
 # --------------------------------------------------
-
+WEATHER_CACHE_FILE = os.path.join(os.path.dirname(__file__), "weather_cache.json")
 weather_cache = {}
+WEATHER_CACHE_LOCK = threading.Lock()
 WEATHER_CACHE_SECONDS = 1800
+
+
+def _load_weather_cache():
+    try:
+        with open(WEATHER_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+            data = json.load(cache_file)
+        if not isinstance(data, dict):
+            return {}
+        return {
+            key: value for key, value in data.items()
+            if isinstance(value, dict)
+            and isinstance(value.get("data"), dict)
+            and isinstance(value.get("saved_at"), (int, float))
+        }
+    except (OSError, ValueError):
+        return {}
+
+
+weather_cache.update(_load_weather_cache())
+
+
+def _save_weather_cache():
+    try:
+        temp_path = WEATHER_CACHE_FILE + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as cache_file:
+            json.dump(weather_cache, cache_file)
+        os.replace(temp_path, WEATHER_CACHE_FILE)
+    except OSError:
+        app.logger.warning("Weather cache could not be saved to disk.")
+
+
+def _met_weather_code(symbol):
+    symbol = str(symbol or "").lower()
+    if "thunder" in symbol:
+        return 95
+    if "snow" in symbol:
+        return 71
+    if "sleet" in symbol:
+        return 68
+    if "rain" in symbol or "shower" in symbol:
+        return 61
+    if "fog" in symbol:
+        return 45
+    if "partlycloudy" in symbol:
+        return 2
+    if "cloudy" in symbol:
+        return 3
+    return 0
+
+
+def _get_backup_weather(latitude, longitude):
+    response = requests.get(
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+        params={"lat": round(latitude, 4), "lon": round(longitude, 4)},
+        headers={
+            **HTTP_HEADERS,
+            "User-Agent": "DisasterAid/1.0 (https://disasteraid-backend.onrender.com)"
+        },
+        timeout=20
+    )
+    response.raise_for_status()
+    payload = response.json()
+    timeseries = payload.get("properties", {}).get("timeseries") if isinstance(payload, dict) else None
+    if not isinstance(timeseries, list) or not timeseries:
+        raise ValueError("Unexpected backup weather response format")
+
+    current_item = timeseries[0]
+    current_data = current_item.get("data", {})
+    current_details = current_data.get("instant", {}).get("details", {})
+    current_step = current_data.get("next_1_hours") or current_data.get("next_6_hours") or current_data.get("next_12_hours") or {}
+    current = {
+        "time": current_item.get("time"),
+        "temperature_2m": current_details.get("air_temperature"),
+        "relative_humidity_2m": current_details.get("relative_humidity"),
+        "precipitation": current_step.get("details", {}).get("precipitation_amount"),
+        "weather_code": _met_weather_code(current_step.get("summary", {}).get("symbol_code")),
+        "wind_speed_10m": current_details.get("wind_speed")
+    }
+
+    grouped = {}
+    for item in timeseries:
+        date = str(item.get("time", ""))[:10]
+        if not date:
+            continue
+        data = item.get("data", {})
+        details = data.get("instant", {}).get("details", {})
+        group = grouped.setdefault(date, {
+            "temperature_2m_max": None, "temperature_2m_min": None,
+            "precipitation_sum": 0.0, "wind_speed_10m_max": 0.0,
+            "weather_code": 0, "rain_sum": 0.0
+        })
+        temperature = details.get("air_temperature")
+        if temperature is not None:
+            group["temperature_2m_max"] = max(temperature, group["temperature_2m_max"] if group["temperature_2m_max"] is not None else temperature)
+            group["temperature_2m_min"] = min(temperature, group["temperature_2m_min"] if group["temperature_2m_min"] is not None else temperature)
+        wind = details.get("wind_speed")
+        if wind is not None:
+            group["wind_speed_10m_max"] = max(group["wind_speed_10m_max"], wind)
+        step = data.get("next_1_hours") or data.get("next_6_hours") or data.get("next_12_hours") or {}
+        precipitation = step.get("details", {}).get("precipitation_amount") or 0.0
+        group["precipitation_sum"] += precipitation
+        group["rain_sum"] += precipitation
+        symbol = step.get("summary", {}).get("symbol_code")
+        if symbol:
+            group["weather_code"] = _met_weather_code(symbol)
+
+    dates = list(grouped)[:7]
+    daily = {
+        "time": dates,
+        "weather_code": [grouped[date]["weather_code"] for date in dates],
+        "temperature_2m_max": [grouped[date]["temperature_2m_max"] for date in dates],
+        "temperature_2m_min": [grouped[date]["temperature_2m_min"] for date in dates],
+        "precipitation_sum": [grouped[date]["precipitation_sum"] for date in dates],
+        "rain_sum": [grouped[date]["rain_sum"] for date in dates],
+        "wind_speed_10m_max": [grouped[date]["wind_speed_10m_max"] for date in dates]
+    }
+    return {"current": current, "daily": daily}
 
 # --------------------------------------------------
 # DATABASE CONFIGURATION
@@ -315,7 +434,6 @@ def health():
 
 @app.route("/api/weather", methods=["GET"])
 def get_weather():
-
     location = clean_location(
         request.args.get("location", "Bengaluru")
     )
@@ -325,57 +443,65 @@ def get_weather():
             "success": False,
             "message": "Please enter a location."
         }), 400
-        
+
+    cache_key = normalize(location)
+    with WEATHER_CACHE_LOCK:
+        cached_weather = weather_cache.get(cache_key)
+        if cached_weather and time.time() - cached_weather.get("saved_at", 0) < WEATHER_CACHE_SECONDS:
+            return jsonify(cached_weather["data"]), 200
+
     try:
-        place = get_indian_place(location)
+        try:
+            place = get_indian_place(location)
+        except (requests.RequestException, ValueError, TypeError):
+            if cached_weather:
+                app.logger.warning("Using cached weather because location lookup failed.")
+                return jsonify(cached_weather["data"]), 200
+            raise
 
         if not place:
+            if cached_weather:
+                return jsonify(cached_weather["data"]), 200
             return jsonify({
                 "success": False,
                 "message": "Location not found. Check the spelling."
             }), 404
 
-        latitude = place["latitude"]
-        longitude = place["longitude"]
-        cache_key = f"{latitude:.4f},{longitude:.4f}"
-        current_time = time.time()
+        latitude = float(place["latitude"])
+        longitude = float(place["longitude"])
+        weather_params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": (
+                "temperature_2m,relative_humidity_2m,"
+                "precipitation,weather_code,wind_speed_10m"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_sum,rain_sum,wind_speed_10m_max"
+            ),
+            "forecast_days": 7,
+            "timezone": "auto"
+        }
 
-        cached_weather = weather_cache.get(cache_key)
-
-        if cached_weather and (
-            current_time - cached_weather["saved_at"]
-            < WEATHER_CACHE_SECONDS
-        ):
-            return jsonify(cached_weather["data"]), 200 
-
-        weather_response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "current": (
-                    "temperature_2m,relative_humidity_2m,"
-                    "precipitation,weather_code,wind_speed_10m"
-                ),
-                "daily": (
-                    "weather_code,temperature_2m_max,temperature_2m_min,"
-                    "precipitation_sum,rain_sum,wind_speed_10m_max"
-                ),
-                "forecast_days": 7,
-                "timezone": "auto"
-            },
-            headers=HTTP_HEADERS,
-            timeout=20
-        )
-
-        weather_response.raise_for_status()
-        weather_data = weather_response.json()
+        try:
+            weather_response = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=weather_params,
+                headers=HTTP_HEADERS,
+                timeout=20
+            )
+            weather_response.raise_for_status()
+            weather_data = weather_response.json()
+            if not isinstance(weather_data, dict) or not isinstance(weather_data.get("daily"), dict):
+                raise ValueError("Unexpected Open-Meteo response format")
+        except (requests.RequestException, ValueError, TypeError) as primary_error:
+            app.logger.warning("Open-Meteo failed; trying MET Norway backup: %s", primary_error)
+            weather_data = _get_backup_weather(latitude, longitude)
 
         daily = weather_data.get("daily") or {}
         forecast = []
-
         dates = daily.get("time", [])
-
         fields = {
             "weather_code": "weather_code",
             "temperature_max": "temperature_2m_max",
@@ -386,19 +512,10 @@ def get_weather():
         }
 
         for index, date in enumerate(dates):
-
             day_data = {"date": date}
-
             for output_key, source_key in fields.items():
-
                 values = daily.get(source_key, [])
-
-                day_data[output_key] = (
-                    values[index]
-                    if index < len(values)
-                    else None
-                )
-
+                day_data[output_key] = values[index] if index < len(values) else None
             forecast.append(day_data)
 
         weather_result = {
@@ -412,34 +529,27 @@ def get_weather():
             "forecast": forecast
         }
 
-        weather_cache[cache_key] = {
-            "data": weather_result,
-            "saved_at": time.time()
-        }
+        with WEATHER_CACHE_LOCK:
+            weather_cache[cache_key] = {
+                "data": weather_result,
+                "saved_at": time.time()
+            }
+            _save_weather_cache()
 
         return jsonify(weather_result), 200
-    
-    except requests.RequestException:
-        app.logger.exception("Weather API request failed")
 
-        cached_weather = weather_cache.get(cache_key)
+    except (requests.RequestException, KeyError, IndexError, TypeError, ValueError):
+        app.logger.exception("Unexpected weather response format")
 
+        with WEATHER_CACHE_LOCK:
+            cached_weather = weather_cache.get(cache_key)
         if cached_weather:
-            app.logger.warning(
-                "Returning cached weather because the weather service failed."
-            )
+            app.logger.warning("Returning the last cached weather snapshot.")
             return jsonify(cached_weather["data"]), 200
 
         return jsonify({
             "success": False,
             "message": "Weather service is temporarily unavailable."
-        }), 502
-    except (KeyError, IndexError, TypeError, ValueError):
-        app.logger.exception("Unexpected weather response format")
-
-        return jsonify({
-            "success": False,
-            "message": "Could not read the weather information."
         }), 502
 # --------------------------------------------------
 # DISASTER REPORT API
