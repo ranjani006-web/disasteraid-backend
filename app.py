@@ -16,7 +16,7 @@ app = Flask(__name__)
 # --------------------------------------------------
 
 weather_cache = {}
-WEATHER_CACHE_SECONDS = 300
+WEATHER_CACHE_SECONDS = 1800
 
 # --------------------------------------------------
 # DATABASE CONFIGURATION
@@ -419,14 +419,22 @@ def get_weather():
 
         return jsonify(weather_result), 200
 
-    except requests.RequestException:
+  except requests.RequestException:
         app.logger.exception("Weather API request failed")
+
+        cached_weather = weather_cache.get(cache_key)
+
+        if cached_weather:
+            app.logger.warning(
+                "Returning cached weather because the weather service failed."
+            )
+
+            return jsonify(cached_weather["data"]), 200
 
         return jsonify({
             "success": False,
             "message": "Weather service is temporarily unavailable."
         }), 502
-
     except (KeyError, IndexError, TypeError, ValueError):
         app.logger.exception("Unexpected weather response format")
 
